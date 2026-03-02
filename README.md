@@ -19,7 +19,7 @@ Raw Data (CSV) → Bronze (Delta) → Silver (Delta) → Gold (Delta) → Dashbo
 | Azure Data Lake Storage Gen2 | Cloud storage |
 | Apache Airflow (Docker) | Pipeline orchestration |
 | PySpark | Data transformation |
-| Power BI / Databricks SQL | Dashboard & visualization |
+| Databricks Dashboard | Dashboard & visualization |
 
 ---
 
