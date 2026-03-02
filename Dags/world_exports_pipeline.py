@@ -1,49 +1,163 @@
 from airflow import DAG
-from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
-from airflow.providers.microsoft.azure.sensors.wasb import WasbPrefixSensor
+from airflow.providers.microsoft.azure.sensors.adls import AzureDataLakeStorageSensor
+from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
+from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
 from datetime import datetime, timedelta
+import json
 
-# 1. Define default arguments
+# ── CHANGE THESE TWO VALUES ──────────────────────────────────────────────────
+DATABRICKS_JOB_ID = 532044085711838
+ADLS_ACCOUNT_NAME = "worldexportsdata"
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── CONNECTION IDs (must match what you set in Airflow UI) ───────────────────
+DATABRICKS_CONN_ID = "databricks_default"
+ADLS_CONN_ID       = "azure_data_lake_default"
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── ADLS PATHS ───────────────────────────────────────────────────────────────
+ADLS_CONTAINER  = "world-exports"
+RAW_FILE_PATH   = "rawData/world_exports_raw.csv"
+# ────────────────────────────────────────────────────────────────────────────
+
 default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    "owner": "world_exports_team",
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+    "email_on_failure": False,
+    "email_on_retry": False,
 }
 
-# 2. Initialize the DAG
+
+def log_pipeline_start(**context):
+    """
+    Logs pipeline start details.
+    Also validates that the Azure connection is properly configured
+    before the sensor even starts — fail fast if credentials are missing.
+    """
+    print("=" * 60)
+    print("   WORLD EXPORTS MEDALLION PIPELINE — STARTING")
+    print("=" * 60)
+
+    # Pull the Azure connection and verify it has credentials
+    # This is a dry-run check — no actual Azure call yet
+    try:
+        conn = BaseHook.get_connection(ADLS_CONN_ID)
+
+        # Read Extra JSON (contains tenant_id and account_name)
+        extra = json.loads(conn.extra) if conn.extra else {}
+
+        client_id    = conn.login
+        tenant_id    = extra.get("tenant_id", "NOT SET")
+        account_name = extra.get("account_name", "NOT SET")
+
+        print(f"  Azure Connection ID : {ADLS_CONN_ID}")
+        print(f"  Client ID found     : {'✅ YES' if client_id else '❌ MISSING'}")
+        print(f"  Client Secret found : {'✅ YES' if conn.password else '❌ MISSING'}")
+        print(f"  Tenant ID found     : {'✅ YES' if tenant_id != 'NOT SET' else '❌ MISSING'}")
+        print(f"  Storage Account     : {account_name}")
+
+        if not client_id or not conn.password or tenant_id == "NOT SET":
+            raise ValueError(
+                "Azure connection is incomplete! "
+                "Go to Airflow UI → Admin → Connections → azure_data_lake_default "
+                "and fill in Login (Client ID), Password (Client Secret), "
+                "and Extra JSON with tenant_id."
+            )
+
+    except Exception as e:
+        raise RuntimeError(f"Connection check failed: {e}")
+
+    print(f"\n  Watching ADLS path  : {ADLS_CONTAINER}/{RAW_FILE_PATH}")
+    print(f"  Databricks Job ID   : {DATABRICKS_JOB_ID}")
+    print(f"  Execution date      : {context['ds']}")
+    print("=" * 60)
+
+
+def log_pipeline_success(**context):
+    """Logs success summary after Databricks job completes."""
+    print("=" * 60)
+    print("   PIPELINE COMPLETE — ALL LAYERS WRITTEN ✅")
+    print("=" * 60)
+    print("  Bronze → raw data ingested as Delta table")
+    print("  Silver → cleaned and validated Delta table")
+    print("  Gold   → KPI aggregations ready for Dashboard")
+    print(f"\n  ADLS Location : {ADLS_ACCOUNT_NAME} / {ADLS_CONTAINER}/")
+    print("  ├── bronze/world_exports/")
+    print("  ├── silver/world_exports_cleaned/")
+    print("  └── gold/")
+    print("       ├── kpi_by_country/")
+    print("       ├── kpi_by_category/")
+    print("       ├── kpi_yearly_trend/")
+    print("       ├── kpi_by_region/")
+    print("       └── kpi_top_exporters/")
+    print("=" * 60)
+
+
 with DAG(
-    'world_exports_analytics_pipeline',
+    dag_id="world_exports_medallion_pipeline",
     default_args=default_args,
-    description='Pipeline to sense, clean and process global trade data',
+    description="ADLS FileSensor → Databricks Medallion Job (Bronze → Silver → Gold)",
+    schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['azure', 'databricks', 'exports'],
+    tags=["medallion", "databricks", "adls", "world-exports", "pyspark"],
 ) as dag:
 
-    # TASK 1: Sensor - Wait for the file to arrive in Azure Blob Storage
-    # This checks the 'raw' container for any file starting with 'trade_data'
-    wait_for_file = WasbPrefixSensor(
-        task_id='wait_for_raw_csv',
-        container_name='raw',
-        prefix='trade_data',
-        wasb_conn_id='azure_blob_default', # Connection defined in Airflow UI
-        timeout=60 * 60, # Wait for 1 hour
-        poke_interval=60 # Check every 60 seconds
+    # ── TASK 1: Validate credentials + log start ─────────────────────────────
+    start_log = PythonOperator(
+        task_id="log_pipeline_start",
+        python_callable=log_pipeline_start,
+        provide_context=True,
     )
 
-    # TASK 2: Run Databricks Notebook
-    # This triggers the cleaning and processing code you wrote earlier
-    notebook_run = DatabricksSubmitRunOperator(
-        task_id='run_cleaning_and_processing',
-        databricks_conn_id='databricks_default', # Connection defined in Airflow UI
-        existing_cluster_id='0000-YOUR-CLUSTER-ID', # Found in Databricks cluster URL
-        notebook_task={
-            'notebook_path': '/Users/your_email/World_Exports_Analytics',
-        }
+    # ── TASK 2: ADLS Gen2 Sensor ──────────────────────────────────────────────
+    # Authenticates using Service Principal from 'azure_data_lake_default'
+    # (Client ID + Client Secret + Tenant ID — all from Airflow connection)
+    # Pokes ADLS every 30 seconds, times out after 1 hour
+    wait_for_file = AzureDataLakeStorageSensor(
+        task_id="wait_for_raw_file_in_adls",
+        path=RAW_FILE_PATH,
+        azure_data_lake_conn_id=ADLS_CONN_ID,
+        container_name=ADLS_CONTAINER,
+        account_name=ADLS_ACCOUNT_NAME,
+        poke_interval=30,     # check every 30 seconds
+        timeout=3600,         # give up after 1 hour
+        mode="poke",          # keeps a worker slot open while waiting
+                              # use mode="reschedule" in production to free the slot
     )
 
-    # Define the sequence
-    wait_for_file >> notebook_run
+    # ── TASK 3: Trigger Databricks Workflow Job ───────────────────────────────
+    # DatabricksRunNowOperator:
+    #   - Calls Databricks REST API: POST /api/2.1/jobs/run-now
+    #   - Authenticates using token from 'databricks_default' connection
+    #   - Triggers your existing Workflow Job (Bronze → Silver → Gold tasks)
+    #   - wait_for_termination=True means Airflow WAITS until the job finishes
+    #   - polling_period_seconds=30 means it checks job status every 30 seconds
+    trigger_databricks_job = DatabricksRunNowOperator(
+        task_id="trigger_medallion_job",
+        databricks_conn_id=DATABRICKS_CONN_ID,
+        job_id=DATABRICKS_JOB_ID,
+        wait_for_termination=True,
+        polling_period_seconds=30,
+    )
+
+    # ── TASK 4: Log success ───────────────────────────────────────────────────
+    success_log = PythonOperator(
+        task_id="log_pipeline_success",
+        python_callable=log_pipeline_success,
+        provide_context=True,
+    )
+
+    # ── PIPELINE ORDER ────────────────────────────────────────────────────────
+    #
+    #   [log_pipeline_start]
+    #          ↓
+    #   [wait_for_raw_file_in_adls]   ← ADLS Sensor (Azure Service Principal auth)
+    #          ↓
+    #   [trigger_medallion_job]        ← Databricks REST API (token auth)
+    #          ↓
+    #   [log_pipeline_success]
+    #
+    start_log >> wait_for_file >> trigger_databricks_job >> success_log
