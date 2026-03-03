@@ -1,5 +1,5 @@
 from airflow import DAG
-from airflow.providers.microsoft.azure.sensors.adls import AzureDataLakeStorageSensor
+from airflow.providers.microsoft.azure.sensors.wasb import WasbBlobSensor
 from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
@@ -99,7 +99,7 @@ with DAG(
     dag_id="world_exports_medallion_pipeline",
     default_args=default_args,
     description="ADLS FileSensor → Databricks Medallion Job (Bronze → Silver → Gold)",
-    schedule_interval="@daily",
+    schedule="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["medallion", "databricks", "adls", "world-exports", "pyspark"],
@@ -109,23 +109,19 @@ with DAG(
     start_log = PythonOperator(
         task_id="log_pipeline_start",
         python_callable=log_pipeline_start,
-        provide_context=True,
     )
 
-    # ── TASK 2: ADLS Gen2 Sensor ──────────────────────────────────────────────
+    # ── TASK 2: WasbBlobSensor ──────────────────────────────────────────────
     # Authenticates using Service Principal from 'azure_data_lake_default'
     # (Client ID + Client Secret + Tenant ID — all from Airflow connection)
     # Pokes ADLS every 30 seconds, times out after 1 hour
-    wait_for_file = AzureDataLakeStorageSensor(
-        task_id="wait_for_raw_file_in_adls",
-        path=RAW_FILE_PATH,
-        azure_data_lake_conn_id=ADLS_CONN_ID,
-        container_name=ADLS_CONTAINER,
-        account_name=ADLS_ACCOUNT_NAME,
-        poke_interval=30,     # check every 30 seconds
-        timeout=3600,         # give up after 1 hour
-        mode="poke",          # keeps a worker slot open while waiting
-                              # use mode="reschedule" in production to free the slot
+    wait_for_file = WasbBlobSensor(
+    task_id="wait_for_file",
+    container_name=ADLS_CONTAINER,
+    blob_name=RAW_FILE_PATH,
+    wasb_conn_id=ADLS_CONN_ID,
+    timeout=300,
+    poke_interval=30,
     )
 
     # ── TASK 3: Trigger Databricks Workflow Job ───────────────────────────────
@@ -147,7 +143,6 @@ with DAG(
     success_log = PythonOperator(
         task_id="log_pipeline_success",
         python_callable=log_pipeline_success,
-        provide_context=True,
     )
 
     # ── PIPELINE ORDER ────────────────────────────────────────────────────────
