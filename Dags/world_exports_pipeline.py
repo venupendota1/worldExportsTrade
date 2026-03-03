@@ -1,16 +1,19 @@
 from airflow import DAG
 from airflow.providers.microsoft.azure.sensors.wasb import WasbBlobSensor
 from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from airflow.hooks.base import BaseHook
+from airflow.providers.databricks.hooks.databricks import DatabricksHook
+from airflow.operators.python import PythonOperator
 from airflow.sensors.base import BaseSensorOperator
+from airflow.hooks.base import BaseHook
 from airflow.utils.context import Context
 from datetime import datetime, timedelta
 import json
+import time
 
-# ── CHANGE THESE TWO VALUES ──────────────────────────────────────────────────
-DATABRICKS_JOB_ID = 532044085711838
-ADLS_ACCOUNT_NAME = "worldexportsdata"
+# ── CHANGE THESE THREE VALUES ─────────────────────────────────────────────────
+DATABRICKS_JOB_ID  = 532044085711838
+DATABRICKS_CLUSTER_ID = "0303-120105-trzn1py3"
+ADLS_ACCOUNT_NAME  = "worldexportsdata"
 # ────────────────────────────────────────────────────────────────────────────
 
 # ── CONNECTION IDs ────────────────────────────────────────────────────────────
@@ -34,10 +37,8 @@ default_args = {
 
 def get_expected_filename(ds: str):
     """
-    Builds the expected filename using yesterday's date.
-    ds format: "YYYY-MM-DD"  e.g. "2026-03-03"
-    returns filename : "world_exports_raw_02_03_2026.csv"
-    returns full_path: "rawData/world_exports_raw_02_03_2026.csv"
+    Builds filename using yesterday's date.
+    ds = "2026-03-03" → "rawData/world_exports_raw_02_03_2026.csv"
     """
     today     = datetime.strptime(ds, "%Y-%m-%d")
     yesterday = today - timedelta(days=1)
@@ -49,12 +50,8 @@ def get_expected_filename(ds: str):
 
 def log_pipeline_start(**context):
     """
-    Task 1 — Validates Azure credentials, logs expected file, pushes
-    the blob path into XCom so the sensor can read it safely.
-
-    FIX: blob_name is now built here in pure Python using context["ds"]
-         and pushed to XCom — no Jinja templating in the sensor at all.
-         This avoids the 'execution_date is undefined' Jinja error entirely.
+    Task 1 — Validates Azure credentials and logs expected filename.
+    Pushes blob path to XCom for the sensor to use.
     """
     ds                  = context["ds"]
     filename, full_path = get_expected_filename(ds)
@@ -66,8 +63,9 @@ def log_pipeline_start(**context):
     print(f"  Looking for file    : {filename}")
     print(f"  Full ADLS path      : {ADLS_CONTAINER}/{full_path}")
     print(f"  Databricks Job ID   : {DATABRICKS_JOB_ID}")
+    print(f"  Cluster ID          : {DATABRICKS_CLUSTER_ID}")
 
-    # ── Credential pre-flight check ──────────────────────────────────────────
+    # Credential pre-flight check
     try:
         conn  = BaseHook.get_connection(ADLS_CONN_ID)
         extra = json.loads(conn.extra) if conn.extra else {}
@@ -91,39 +89,146 @@ def log_pipeline_start(**context):
 
         if missing:
             raise ValueError(
-                f"Connection '{ADLS_CONN_ID}' is missing: {', '.join(missing)}. "
-                f"Fix in Airflow UI → Admin → Connections → {ADLS_CONN_ID}"
+                f"Connection '{ADLS_CONN_ID}' is missing: {', '.join(missing)}."
             )
 
     except Exception as e:
         raise RuntimeError(f"Pre-flight credential check failed: {e}")
 
-    print(f"\n  ✅ All credentials verified.")
-    print(f"  ✅ Blob path pushed to XCom: {full_path}")
+    print("\n  ✅ All credentials verified.")
     print("=" * 60)
 
-    # Push blob path to XCom — sensor will pull this in the next task
-    # XCom key: "blob_name"
+    # Push blob path to XCom for the sensor
     context["ti"].xcom_push(key="blob_name", value=full_path)
-
     return full_path
 
 
+def ensure_cluster_running(**context):
+    
+    hook   = DatabricksHook(databricks_conn_id=DATABRICKS_CONN_ID)
+    client = hook  # DatabricksHook has direct API methods
+
+    print("=" * 60)
+    print("   CLUSTER STATUS CHECK")
+    print("=" * 60)
+    print(f"  Cluster ID : {DATABRICKS_CLUSTER_ID}")
+
+    # ── Step 1: Get current cluster state ────────────────────────────────────
+    # Calls Databricks REST API: GET /2.0/clusters/get
+    cluster_info = hook._do_api_call(
+        ("GET", "2.0/clusters/get"),
+        {"cluster_id": DATABRICKS_CLUSTER_ID}
+    )
+
+    state       = cluster_info.get("state", "UNKNOWN")
+    cluster_name = cluster_info.get("cluster_name", "unknown")
+
+    print(f"  Cluster name  : {cluster_name}")
+    print(f"  Current state : {state}")
+
+    # ── Step 2: Handle each state ─────────────────────────────────────────────
+
+    if state == "RUNNING":
+        # Already up — nothing to do
+        print("  ✅ Cluster is already RUNNING. Proceeding to job trigger.")
+        return
+
+    elif state == "TERMINATED":
+        # Most common case — Community Edition auto-terminated
+        # Start it and wait
+        print("  🟡 Cluster is TERMINATED. Starting it now...")
+
+        hook._do_api_call(
+            ("POST", "2.0/clusters/start"),
+            {"cluster_id": DATABRICKS_CLUSTER_ID}
+        )
+        print("  ⏳ Start command sent. Waiting for cluster to be RUNNING...")
+        _wait_for_cluster_running(hook)
+
+    elif state in ("PENDING", "RESTARTING"):
+        # Already in the process of starting — just wait
+        print(f"  🟡 Cluster is {state}. Waiting for it to be RUNNING...")
+        _wait_for_cluster_running(hook)
+
+    elif state == "TERMINATING":
+        # Mid-shutdown — wait for it to fully stop, then start
+        print("  🟡 Cluster is TERMINATING. Waiting for full stop first...")
+        _wait_for_state(hook, target_state="TERMINATED")
+        print("  🟡 Now starting the cluster...")
+        hook._do_api_call(
+            ("POST", "2.0/clusters/start"),
+            {"cluster_id": DATABRICKS_CLUSTER_ID}
+        )
+        _wait_for_cluster_running(hook)
+
+    elif state == "ERROR":
+        # Something is wrong with the cluster itself
+        state_message = cluster_info.get("state_message", "No details available")
+        raise RuntimeError(
+            f"Cluster {DATABRICKS_CLUSTER_ID} is in ERROR state: {state_message}. "
+            f"Please fix the cluster in Databricks UI before retrying."
+        )
+
+    else:
+        raise RuntimeError(
+            f"Cluster is in unexpected state: {state}. "
+            f"Please check Databricks UI."
+        )
+
+
+def _wait_for_cluster_running(hook, timeout_minutes=15, poll_interval_seconds=30):
+    
+    timeout_seconds = timeout_minutes * 60
+    elapsed         = 0
+
+    while elapsed < timeout_seconds:
+        cluster_info = hook._do_api_call(
+            ("GET", "2.0/clusters/get"),
+            {"cluster_id": DATABRICKS_CLUSTER_ID}
+        )
+        state = cluster_info.get("state", "UNKNOWN")
+        print(f"  ⏳ Cluster state: {state} (waited {elapsed}s so far...)")
+
+        if state == "RUNNING":
+            print(f"  ✅ Cluster is RUNNING after {elapsed}s!")
+            return
+
+        if state == "ERROR":
+            msg = cluster_info.get("state_message", "No details")
+            raise RuntimeError(f"Cluster entered ERROR state while starting: {msg}")
+
+        time.sleep(poll_interval_seconds)
+        elapsed += poll_interval_seconds
+
+    raise RuntimeError(
+        f"Cluster did not start within {timeout_minutes} minutes. "
+        f"Check Databricks UI for details."
+    )
+
+
+def _wait_for_state(hook, target_state, timeout_minutes=10, poll_interval_seconds=20):
+    """Waits until cluster reaches a specific target state."""
+    timeout_seconds = timeout_minutes * 60
+    elapsed         = 0
+
+    while elapsed < timeout_seconds:
+        cluster_info = hook._do_api_call(
+            ("GET", "2.0/clusters/get"),
+            {"cluster_id": DATABRICKS_CLUSTER_ID}
+        )
+        state = cluster_info.get("state", "UNKNOWN")
+        print(f"  ⏳ Waiting for {target_state}. Current: {state} ({elapsed}s)")
+
+        if state == target_state:
+            return
+
+        time.sleep(poll_interval_seconds)
+        elapsed += poll_interval_seconds
+
+    raise RuntimeError(f"Cluster did not reach {target_state} within {timeout_minutes} minutes.")
+
+
 class DynamicWasbBlobSensor(BaseSensorOperator):
-    """
-    FIX: Custom sensor that pulls the blob_name from XCom at runtime.
-
-    Why custom?
-        WasbBlobSensor expects blob_name at DAG parse time.
-        But our blob_name changes daily (based on yesterday's date).
-        Jinja templates in WasbBlobSensor fail in some Airflow 2.x versions.
-
-        Solution: subclass BaseSensorOperator, pull blob_name from XCom
-        at poke time (runtime), then use WasbHook directly to check ADLS.
-
-    Think of it like a protocol in Swift — we implement the poke() method
-    and Airflow calls it on our schedule.
-    """
 
     def __init__(self, wasb_conn_id: str, container_name: str, **kwargs):
         super().__init__(**kwargs)
@@ -133,64 +238,54 @@ class DynamicWasbBlobSensor(BaseSensorOperator):
     def poke(self, context: Context) -> bool:
         from airflow.providers.microsoft.azure.hooks.wasb import WasbHook
 
-        # Pull the blob path that log_pipeline_start pushed to XCom
         blob_name = context["ti"].xcom_pull(
             task_ids="log_pipeline_start",
             key="blob_name"
         )
 
         if not blob_name:
-            raise ValueError(
-                "blob_name not found in XCom. "
-                "Make sure log_pipeline_start ran successfully before this task."
-            )
+            raise ValueError("blob_name not found in XCom.")
 
-        self.log.info(f"Checking ADLS for blob: {self.container_name}/{blob_name}")
+        self.log.info(f"Checking ADLS: {self.container_name}/{blob_name}")
 
-        # Use WasbHook to check if the file exists in ADLS
         hook   = WasbHook(wasb_conn_id=self.wasb_conn_id)
         exists = hook.check_for_blob(self.container_name, blob_name)
 
         if exists:
             self.log.info(f"✅ File found: {self.container_name}/{blob_name}")
         else:
-            self.log.info(f"⏳ File not yet available. Will retry in {self.poke_interval}s")
+            self.log.info(f"⏳ File not yet available. Retrying in {self.poke_interval}s")
 
         return exists
 
 
 def log_pipeline_success(**context):
-    """Task 4 — Logs success summary after Databricks job completes."""
+    """Task 5 — Logs success summary."""
     ds                  = context["ds"]
     filename, full_path = get_expected_filename(ds)
 
     print("=" * 60)
     print("   PIPELINE COMPLETE — ALL LAYERS WRITTEN ✅")
     print("=" * 60)
-    print(f"  File processed      : {filename}")
-    print(f"  DAG run date        : {ds}")
-    print(f"  Completed at        : {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}")
+    print(f"  File processed : {filename}")
+    print(f"  Completed at   : {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}")
     print()
     print("  Layers written to ADLS:")
-    print(f"  ├── bronze/world_exports/          ← raw ingestion")
-    print(f"  ├── silver/world_exports_cleaned/  ← cleaned data")
-    print(f"  └── gold/")
-    print(f"       ├── kpi_by_country/")
-    print(f"       ├── kpi_by_category/")
-    print(f"       ├── kpi_yearly_trend/")
-    print(f"       ├── kpi_by_region/")
-    print(f"       └── kpi_top_exporters/")
-    print()
-    print(f"  ADLS Account        : {ADLS_ACCOUNT_NAME}")
-    print(f"  Container           : {ADLS_CONTAINER}")
-    print("  Databricks Dashboard is ready to refresh ✅")
+    print("  ├── bronze/world_exports/")
+    print("  ├── silver/world_exports_cleaned/")
+    print("  └── gold/")
+    print("       ├── kpi_by_country/")
+    print("       ├── kpi_by_category/")
+    print("       ├── kpi_yearly_trend/")
+    print("       ├── kpi_by_region/")
+    print("       └── kpi_top_exporters/")
     print("=" * 60)
 
 
 with DAG(
     dag_id="world_exports_medallion_pipeline",
     default_args=default_args,
-    description="Daily 10AM: Watches ADLS for dated CSV → Triggers Databricks Medallion Job",
+    description="Daily 10AM: ADLS Sensor → Cluster Check → Databricks Medallion Job",
     schedule="0 10 * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
@@ -204,9 +299,7 @@ with DAG(
         python_callable=log_pipeline_start,
     )
 
-    # ── TASK 2: Custom Sensor — pulls blob path from XCom, checks ADLS ───────
-    # No Jinja. No execution_date. Pure Python at runtime.
-    # Pokes every 60s, gives up after 2 hours, frees Docker worker between pokes.
+    # ── TASK 2: Wait for yesterday's dated file in ADLS ──────────────────────
     wait_for_file = DynamicWasbBlobSensor(
         task_id="wait_for_dated_file_in_adls",
         wasb_conn_id=ADLS_CONN_ID,
@@ -216,7 +309,14 @@ with DAG(
         mode="reschedule",
     )
 
-    # ── TASK 3: Trigger Databricks Workflow Job ───────────────────────────────
+    # ── TASK 3: Ensure cluster is RUNNING before triggering job ──────────────
+    # Checks state → starts if terminated → waits up to 15 mins
+    ensure_cluster = PythonOperator(
+        task_id="ensure_cluster_running",
+        python_callable=ensure_cluster_running,
+    )
+
+    # ── TASK 4: Trigger Databricks Workflow Job ───────────────────────────────
     trigger_databricks_job = DatabricksRunNowOperator(
         task_id="trigger_medallion_job",
         databricks_conn_id=DATABRICKS_CONN_ID,
@@ -225,7 +325,7 @@ with DAG(
         polling_period_seconds=30,
     )
 
-    # ── TASK 4: Log success ───────────────────────────────────────────────────
+    # ── TASK 5: Log success ───────────────────────────────────────────────────
     success_log = PythonOperator(
         task_id="log_pipeline_success",
         python_callable=log_pipeline_success,
@@ -233,12 +333,14 @@ with DAG(
 
     # ── PIPELINE ORDER ────────────────────────────────────────────────────────
     #
-    #   [log_pipeline_start]           → builds blob path, pushes to XCom
+    #   [log_pipeline_start]            → validates creds, pushes blob path
     #          ↓
-    #   [wait_for_dated_file_in_adls]  → pulls blob path from XCom, pokes ADLS
+    #   [wait_for_dated_file_in_adls]   → pokes ADLS every 60s for dated CSV
     #          ↓
-    #   [trigger_medallion_job]         → triggers Databricks Bronze→Silver→Gold
+    #   [ensure_cluster_running]         → checks cluster, starts if terminated
     #          ↓
-    #   [log_pipeline_success]          → logs completion summary
+    #   [trigger_medallion_job]           → triggers Databricks Bronze→Silver→Gold
+    #          ↓
+    #   [log_pipeline_success]            → logs completion summary
     #
-    start_log >> wait_for_file >> trigger_databricks_job >> success_log
+    start_log >> wait_for_file >> ensure_cluster >> trigger_databricks_job >> success_log
